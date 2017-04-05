@@ -1,0 +1,5 @@
+name = Multiple file form element
+description = Defines a multiple file form element.
+version = VERSION
+core = 7.x
+dependencies[] = file
