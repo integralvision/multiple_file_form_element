@@ -1,0 +1,671 @@
+<?php
+/**
+ * @file
+ * Multiple file form element module.
+ */
+
+/**
+ * Implements hook_element_info().
+ */
+function multiple_file_form_element_element_info() {
+  $file_path = drupal_get_path('module', 'file');
+  $types['managed_file_multiple'] = array(
+    '#input' => TRUE,
+    '#process' => array('_file_managed_multiple_file_process'),
+    '#value_callback' => '_file_managed_multiple_file_value',
+    '#element_validate' => array('_file_managed_multiple_file_validate'),
+    '#pre_render' => array('_file_managed_multiple_file_pre_render'),
+    '#theme' => 'file_managed_multiple_file',
+    '#theme_wrappers' => array('form_element'),
+    '#progress_indicator' => 'throbber',
+    '#progress_message' => NULL,
+    '#upload_validators' => array(),
+    '#upload_location' => NULL,
+    '#size' => 22,
+    '#attached' => array(
+      'css' => array($file_path . '/file.css'),
+      'js' => array($file_path . '/file.js'),
+    ),
+  );
+  return $types;
+}
+
+/**
+ * Process function to expand the managed_file element type.
+ *
+ * Expands the file type to include Upload and Remove buttons, as well as
+ * support for a default value.
+ */
+function _file_managed_multiple_file_process($element, &$form_state, $form) {
+  // Append the '-upload' to the #id so the field label's 'for' attribute
+  // corresponds with the file element.
+  $original_id = $element['#id'];
+  $element['#id'] .= '-upload';
+
+  // Set some default element properties.
+  $element['#progress_indicator'] = empty($element['#progress_indicator']) ? 'none' : $element['#progress_indicator'];
+  $element['#files'] = array();
+  foreach ($element['#value'] as $i => $file) {
+    if (is_array($file)) {
+      $file = !empty($file['fid']) ? file_load($file['fid']) : NULL;
+    }
+
+    if (empty($file)) {
+      continue;
+    }
+    $element['#files'][$i] = $file;
+    $element['fid'][$i] = array(
+      '#type' => 'hidden',
+      '#value' => $file->fid,
+    );
+  }
+  $element['#tree'] = TRUE;
+
+  $ajax_settings = array(
+    'path' => 'file/ajax/' . implode('/', $element['#array_parents']) . '/' . $form['form_build_id']['#value'],
+    'wrapper' => $original_id . '-ajax-wrapper',
+    'effect' => 'fade',
+    'progress' => array(
+      'type' => $element['#progress_indicator'],
+      'message' => $element['#progress_message'],
+    ),
+  );
+
+  // Set up the buttons first since we need to check if they were clicked.
+  $element['upload_button'] = array(
+    '#name' => implode('_', $element['#parents']) . '_upload_button',
+    '#type' => 'submit',
+    '#value' => t('Upload'),
+    '#validate' => array(),
+    '#submit' => array('file_managed_file_submit'),
+    '#limit_validation_errors' => array($element['#parents']),
+    '#ajax' => $ajax_settings,
+    '#weight' => -5,
+  );
+
+  // Force the progress indicator for the remove button to be either 'none' or
+  // 'throbber', even if the upload button is using something else.
+  $ajax_settings['progress']['type'] = ($element['#progress_indicator'] == 'none') ? 'none' : 'throbber';
+  $ajax_settings['progress']['message'] = NULL;
+  $ajax_settings['effect'] = 'none';
+
+  // Add progress bar support to the upload if possible.
+  if ($element['#progress_indicator'] == 'bar' && $implementation = file_progress_implementation()) {
+    $upload_progress_key = mt_rand();
+
+    if ($implementation == 'uploadprogress') {
+      $element['UPLOAD_IDENTIFIER'] = array(
+        '#type' => 'hidden',
+        '#value' => $upload_progress_key,
+        '#attributes' => array('class' => array('file-progress')),
+        // Uploadprogress extension requires this field to be at the top of the
+        // form.
+        '#weight' => -20,
+      );
+    }
+    elseif ($implementation == 'apc') {
+      $element['APC_UPLOAD_PROGRESS'] = array(
+        '#type' => 'hidden',
+        '#value' => $upload_progress_key,
+        '#attributes' => array('class' => array('file-progress')),
+        // Uploadprogress extension requires this field to be at the top of the
+        // form.
+        '#weight' => -20,
+      );
+    }
+
+    // Add the upload progress callback.
+    $element['upload_button']['#ajax']['progress']['path'] = 'file/progress/' . $upload_progress_key;
+  }
+
+  // The file upload field itself.
+  $element['upload'] = array(
+    '#name' => 'files[' . implode('_', $element['#parents']) . '][]',
+    '#type' => 'file',
+    '#title' => t('Choose files'),
+    '#title_display' => 'invisible',
+    '#size' => $element['#size'],
+    '#theme_wrappers' => array(),
+    '#weight' => -10,
+    '#attributes' => array('multiple' => 'multiple'),
+  );
+
+  if (!empty($element['#files'])) {
+    $element['filename'] = array(
+      '#theme' => 'item_list',
+      '#items' => array(),
+      '#weight' => -10,
+    );
+    foreach ($element['#files'] as $file) {
+      $element['filename']['#items'][] = theme('file_link', array('file' => $file));
+      // Anonymous users who have uploaded a temporary file need a
+      // non-session-based token added so file_managed_file_value() can check
+      // that they have permission to use this file on subsequent submissions of
+      // the same form (for example, after an Ajax upload or form validation
+      // error).
+      if (!$GLOBALS['user']->uid && $element['#file']->status != FILE_STATUS_PERMANENT) {
+        $element['fid_token'][] = array(
+          '#type' => 'hidden',
+          '#value' => drupal_hmac_base64('file-' . $fid, drupal_get_private_key() . drupal_get_hash_salt()),
+        );
+      }
+    }
+  }
+
+  // Add the extension list to the page as JavaScript settings.
+  if (isset($element['#upload_validators']['file_validate_extensions'][0])) {
+    $extension_list = implode(',', array_filter(explode(' ', $element['#upload_validators']['file_validate_extensions'][0])));
+    $element['upload']['#attached']['js'] = array(
+      array(
+        'type' => 'setting',
+        'data' => array('file' => array('elements' => array('#' . $element['#id'] => $extension_list)))
+      )
+    );
+  }
+
+  // Prefix and suffix used for Ajax replacement.
+  $element['#prefix'] = '<div id="' . $original_id . '-ajax-wrapper">';
+  $element['#suffix'] = '</div>';
+
+  return $element;
+}
+
+/**
+ * The #value_callback for a managed_file type element.
+ */
+function _file_managed_multiple_file_value(&$element, $input = FALSE, $form_state = NULL) {
+  $default = array('fid' => 0);
+
+  $return = array($default);
+
+  // Find the current value of this field from the form state.
+  $form_state_values = $form_state['input'];
+  foreach ($element['#parents'] as $parent) {
+    $form_state_values = isset($form_state_values[$parent]) ? $form_state_values[$parent] : array($default);
+  }
+
+  $fids = array();
+  $files = array();
+  foreach ($form_state_values['fid'] as $fid) {
+    if (
+      isset($fid)
+      && is_numeric($fid)
+      && $file = file_load($fid)
+    ) {
+      $fids[] = array('fid' => $file->fid);
+      $files[$file->fid] = $file;
+    }
+  }
+
+  if (!empty($fids)) {
+    unset($return[0]);
+    $return = $files;
+  }
+
+  // Process any input and save new uploads.
+  if ($input !== FALSE) {
+    $new_files = array();
+    $saved_files = _file_managed_multiple_file_save_upload($element);
+    if (!empty($saved_files)) {
+      foreach ($saved_files as $file) {
+        $new_files[$file->fid] = $file;
+      }
+    }
+
+    if (!empty($new_files)) {
+      unset($return[0]);
+      $return += $new_files;
+    }
+    // Uploads take priority over all other values.
+  }
+
+  // If there is no input or if the default value was requested above, use the
+  // default value.
+  if ($input === FALSE) {
+    $default_fid = isset($element['#default_value']) ? $element['#default_value'] : array($default);
+    $return = isset($element['#default_value']) ? $element['#default_value'] : array($default);
+
+    // Confirm that the file exists when used as a default value.
+    if ($default_fid) {
+      $default_files = file_load_multiple(array_column($default_fid, 'fid'));
+      if (!empty($default_files)) {
+        unset($return[0]);
+        $return = $default_files;
+      }
+    }
+  }
+
+  return $return;
+}
+
+/**
+ * Saves any files that have been uploaded into a managed_file element.
+ *
+ * @param $element
+ *   The FAPI element whose values are being saved.
+ *
+ * @return
+ *   The file object representing the file that was saved, or FALSE if no file
+ *   was saved.
+ */
+function _file_managed_multiple_file_save_upload($element) {
+  $upload_name = implode('_', $element['#parents']);
+  if (empty($_FILES['files']['name'][$upload_name])) {
+    return FALSE;
+  }
+
+  $destination = isset($element['#upload_location']) ? $element['#upload_location'] : NULL;
+  if (isset($destination) && !file_prepare_directory($destination, FILE_CREATE_DIRECTORY)) {
+    watchdog('file', 'The upload directory %directory for the file field !name could not be created or is not accessible. A newly uploaded file could not be saved in this directory as a consequence, and the upload was canceled.', array('%directory' => $destination, '!name' => $element['#field_name']));
+    form_set_error($upload_name, t('The file could not be uploaded.'));
+    return FALSE;
+  }
+
+  $files = NULL;
+  foreach ($_FILES['files']['name'][$upload_name] as $i => $error) {
+    if (
+      empty($_FILES['files']['name'][$upload_name][$i])
+      && empty($_FILES['files']['type'][$upload_name][$i])
+      && empty($_FILES['files']['tmp_name'][$upload_name][$i])
+      && $_FILES['files']['error'][$upload_name][$i] === UPLOAD_ERR_NO_FILE
+      && empty($_FILES['files']['size'][$upload_name][$i])
+    ) {
+      continue;
+    }
+    if (!isset($files)) {
+      $files = array();
+    }
+    if ($file = _file_multiple_save_upload($upload_name, $i, $element['#upload_validators'], $destination)) {
+      $files[$i] = $file;
+    }
+  }
+  if (isset($files) && empty($files)) {
+    watchdog(
+      'file',
+      'The file upload failed. %upload',
+      array('%upload' => $upload_name)
+    );
+    form_set_error(
+      $upload_name,
+      t(
+        'The file in the !name field was unable to be uploaded.',
+        array('!name' => $element['#title'])
+      )
+    );
+    return FALSE;
+  }
+
+  return $files;
+}
+
+/**
+ * Saves a file upload to a new location.
+ *
+ * The file will be added to the {file_managed} table as a temporary file.
+ * Temporary files are periodically cleaned. To make the file a permanent file,
+ * assign the status and use file_save() to save the changes.
+ *
+ * @param $form_field_name
+ *   A string that is the associative array key of the upload form element in
+ *   the form array.
+ * @param $validators
+ *   An optional, associative array of callback functions used to validate the
+ *   file. See file_validate() for a full discussion of the array format.
+ *   If no extension validator is provided it will default to a limited safe
+ *   list of extensions which is as follows: "jpg jpeg gif png txt
+ *   doc xls pdf ppt pps odt ods odp". To allow all extensions you must
+ *   explicitly set the 'file_validate_extensions' validator to an empty array
+ *   (Beware: this is not safe and should only be allowed for trusted users, if
+ *   at all).
+ * @param $destination
+ *   A string containing the URI that the file should be copied to. This must
+ *   be a stream wrapper URI. If this value is omitted, Drupal's temporary
+ *   files scheme will be used ("temporary://").
+ * @param $replace
+ *   Replace behavior when the destination file already exists:
+ *   - FILE_EXISTS_REPLACE: Replace the existing file.
+ *   - FILE_EXISTS_RENAME: Append _{incrementing number} until the filename is
+ *     unique.
+ *   - FILE_EXISTS_ERROR: Do nothing and return FALSE.
+ *
+ * @return
+ *   An object containing the file information if the upload succeeded, FALSE
+ *   in the event of an error, or NULL if no file was uploaded. The
+ *   documentation for the "File interface" group, which you can find under
+ *   Related topics, or the header at the top of this file, documents the
+ *   components of a file object. In addition to the standard components,
+ *   this function adds:
+ *   - source: Path to the file before it is moved.
+ *   - destination: Path to the file after it is moved (same as 'uri').
+ */
+function _file_multiple_save_upload($form_field_name, $i, $validators = array(), $destination = FALSE, $replace = FILE_EXISTS_RENAME) {
+  global $user;
+  static $upload_cache;
+
+  // Return cached objects without processing since the file will have
+  // already been processed and the paths in _FILES will be invalid.
+  if (isset($upload_cache[$form_field_name][$i])) {
+    return $upload_cache[$form_field_name][$i];
+  }
+
+  // Make sure there's an upload to process.
+  if (empty($_FILES['files']['name'][$form_field_name][$i])) {
+    return NULL;
+  }
+
+  // Check for file upload errors and return FALSE if a lower level system
+  // error occurred. For a complete list of errors:
+  // See http://php.net/manual/features.file-upload.errors.php.
+  switch ($_FILES['files']['error'][$form_field_name][$i]) {
+    case UPLOAD_ERR_INI_SIZE:
+    case UPLOAD_ERR_FORM_SIZE:
+      drupal_set_message(
+        t(
+          'The file %file could not be saved, because it exceeds %maxsize, the maximum allowed size for uploads.',
+          array(
+            '%file' => $_FILES['files']['name'][$form_field_name][$i],
+            '%maxsize' => format_size(file_upload_max_size())
+          )
+        ),
+        'error'
+      );
+      return FALSE;
+
+    case UPLOAD_ERR_PARTIAL:
+    case UPLOAD_ERR_NO_FILE:
+      drupal_set_message(
+        t(
+          'The file %file could not be saved, because the upload did not complete.',
+          array(
+            '%file' => $_FILES['files']['name'][$form_field_name][$i]
+          )
+        ),
+        'error'
+      );
+      return FALSE;
+
+    case UPLOAD_ERR_OK:
+      // Final check that this is a valid upload, if it isn't, use the
+      // default error handler.
+      if (is_uploaded_file($_FILES['files']['tmp_name'][$form_field_name][$i])) {
+        break;
+      }
+
+    // Unknown error
+    default:
+      drupal_set_message(
+        t(
+          'The file %file could not be saved. An unknown error has occurred.',
+          array(
+            '%file' => $_FILES['files']['name'][$form_field_name][$i],
+          )
+        ),
+        'error'
+      );
+      return FALSE;
+  }
+
+  // Begin building file object.
+  $file = new stdClass();
+  $file->uid      = $user->uid;
+  $file->status   = 0;
+  $file->filename = trim(drupal_basename($_FILES['files']['name'][$form_field_name][$i]), '.');
+  $file->uri      = $_FILES['files']['tmp_name'][$form_field_name][$i];
+  $file->filemime = file_get_mimetype($file->filename);
+  $file->filesize = $_FILES['files']['size'][$form_field_name][$i];
+
+  $extensions = '';
+  if (isset($validators['file_validate_extensions'])) {
+    if (isset($validators['file_validate_extensions'][0])) {
+      // Build the list of non-munged extensions if the caller provided them.
+      $extensions = $validators['file_validate_extensions'][0];
+    }
+    else {
+      // If 'file_validate_extensions' is set and the list is empty then the
+      // caller wants to allow any extension. In this case we have to remove the
+      // validator or else it will reject all extensions.
+      unset($validators['file_validate_extensions']);
+    }
+  }
+  else {
+    // No validator was provided, so add one using the default list.
+    // Build a default non-munged safe list for file_munge_filename().
+    $extensions = 'jpg jpeg gif png txt doc xls pdf ppt pps odt ods odp';
+    $validators['file_validate_extensions'] = array();
+    $validators['file_validate_extensions'][0] = $extensions;
+  }
+
+  if (!empty($extensions)) {
+    // Munge the filename to protect against possible malicious extension hiding
+    // within an unknown file type (ie: filename.html.foo).
+    $file->filename = file_munge_filename($file->filename, $extensions);
+  }
+
+  // Rename potentially executable files, to help prevent exploits (i.e. will
+  // rename filename.php.foo and filename.php to filename.php.foo.txt and
+  // filename.php.txt, respectively). Don't rename if 'allow_insecure_uploads'
+  // evaluates to TRUE.
+  if (
+    !variable_get('allow_insecure_uploads', 0)
+    && preg_match('/\.(php|pl|py|cgi|asp|js)(\.|$)/i', $file->filename)
+    && (substr($file->filename, -4) != '.txt')
+  ) {
+    $file->filemime = 'text/plain';
+    $file->uri .= '.txt';
+    $file->filename .= '.txt';
+    // The .txt extension may not be in the allowed list of extensions. We have
+    // to add it here or else the file upload will fail.
+    if (!empty($extensions)) {
+      $validators['file_validate_extensions'][0] .= ' txt';
+      drupal_set_message(
+        t(
+          'For security reasons, your upload has been renamed to %filename.',
+          array('%filename' => $file->filename)
+        )
+      );
+    }
+  }
+
+  // If the destination is not provided, use the temporary directory.
+  if (empty($destination)) {
+    $destination = 'temporary://';
+  }
+
+  // Assert that the destination contains a valid stream.
+  $destination_scheme = file_uri_scheme($destination);
+  if (
+    !$destination_scheme
+    || !file_stream_wrapper_valid_scheme($destination_scheme)
+  ) {
+    drupal_set_message(
+      t(
+        'The file could not be uploaded, because the destination %destination is invalid.',
+        array('%destination' => $destination)
+      ),
+      'error'
+    );
+    return FALSE;
+  }
+
+  $file->source = $form_field_name;
+  // A URI may already have a trailing slash or look like "public://".
+  if (substr($destination, -1) != '/') {
+    $destination .= '/';
+  }
+  $file->destination = file_destination($destination . $file->filename, $replace);
+  // If file_destination() returns FALSE then $replace == FILE_EXISTS_ERROR and
+  // there's an existing file so we need to bail.
+  if ($file->destination === FALSE) {
+    drupal_set_message(
+      t(
+        'The file %source could not be uploaded because a file by that name already exists in the destination %directory.',
+        array(
+          '%source' => $form_field_name,
+          '%directory' => $destination,
+        )
+      ),
+      'error'
+    );
+    return FALSE;
+  }
+
+  // Add in our check of the file name length.
+  $validators['file_validate_name_length'] = array();
+
+  // Call the validation functions specified by this function's caller.
+  $errors = file_validate($file, $validators);
+
+  // Check for errors.
+  if (!empty($errors)) {
+    $message = t('The specified file %name could not be uploaded.', array('%name' => $file->filename));
+    if (count($errors) > 1) {
+      $message .= theme('item_list', array('items' => $errors));
+    }
+    else {
+      $message .= ' ' . array_pop($errors);
+    }
+    form_set_error($form_field_name, $message);
+    return FALSE;
+  }
+
+  // Move uploaded files from PHP's upload_tmp_dir to Drupal's temporary
+  // directory. This overcomes open_basedir restrictions for future file
+  // operations.
+  $file->uri = $file->destination;
+  if (!drupal_move_uploaded_file($_FILES['files']['tmp_name'][$form_field_name][$i], $file->uri)) {
+    form_set_error($form_field_name, t('File upload error. Could not move uploaded file.'));
+    watchdog(
+      'file',
+      'Upload error. Could not move uploaded file %file to destination %destination.',
+      array(
+        '%file' => $file->filename,
+        '%destination' => $file->uri,
+      )
+    );
+    return FALSE;
+  }
+
+  // Set the permissions on the new file.
+  drupal_chmod($file->uri);
+
+  // If we are replacing an existing file re-use its database record.
+  if ($replace == FILE_EXISTS_REPLACE) {
+    $existing_files = file_load_multiple(array(), array('uri' => $file->uri));
+    if (count($existing_files)) {
+      $existing = reset($existing_files);
+      $file->fid = $existing->fid;
+    }
+  }
+
+  // If we made it this far it's safe to record this file in the database.
+  if ($file = file_save($file)) {
+    // Add file to the cache.
+    $upload_cache[$form_field_name][$i] = $file;
+    return $file;
+  }
+  return FALSE;
+}
+
+/**
+ * An #element_validate callback for the managed_file element.
+ */
+function _file_managed_multiple_file_validate(&$element, &$form_state) {
+  // If referencing an existing file, only allow if there are existing
+  // references. This prevents unmanaged files from being deleted if this
+  // item were to be deleted.
+  $clicked_button = end($form_state['triggering_element']['#parents']);
+  if ($clicked_button != 'remove_button' && !empty($element['fids'])) {
+    if ($file = file_load($element['fid']['#value'])) {
+      if ($file->status == FILE_STATUS_PERMANENT) {
+        $references = file_usage_list($file);
+        if (empty($references)) {
+          form_error($element, t('The file used in the !name field may not be referenced.', array('!name' => $element['#title'])));
+        }
+      }
+    }
+    else {
+      form_error($element, t('The file referenced by the !name field does not exist.', array('!name' => $element['#title'])));
+    }
+  }
+
+  // Check required property based on the FID.
+  if (
+    $element['#required']
+    && empty($element['fid']['#value'])
+    && !in_array($clicked_button, array('upload_button', 'remove_button'))
+  ) {
+    form_error($element['upload'], t('!name field is required.', array('!name' => $element['#title'])));
+  }
+}
+
+/**
+ * #pre_render callback to hide display of the upload or remove controls.
+ *
+ * Upload controls are hidden when a file is already uploaded. Remove controls
+ * are hidden when there is no file attached. Controls are hidden here instead
+ * of in file_managed_file_process(), because #access for these buttons depends
+ * on the managed_file element's #value. See the documentation of form_builder()
+ * for more detailed information about the relationship between #process,
+ * #value, and #access.
+ *
+ * Because #access is set here, it affects display only and does not prevent
+ * JavaScript or other untrusted code from submitting the form as though access
+ * were enabled. The form processing functions for these elements should not
+ * assume that the buttons can't be "clicked" just because they are not
+ * displayed.
+ *
+ * @see file_managed_file_process()
+ * @see form_builder()
+ */
+function _file_managed_multiple_file_pre_render($element) {
+  // If we already have a file, we don't want to show the upload controls.
+  if (!empty($element['#value']['fid'])) {
+    $element['upload']['#access'] = FALSE;
+    $element['upload_button']['#access'] = FALSE;
+  }
+  // If we don't already have a file, there is nothing to remove.
+  else {
+    $element['remove_button']['#access'] = FALSE;
+  }
+  return $element;
+}
+
+/**
+ * Returns HTML for a managed file element.
+ *
+ * @param $variables
+ *   An associative array containing:
+ *   - element: A render element representing the file.
+ *
+ * @ingroup themeable
+ */
+function theme_managed_file_multiple($variables) {
+  $element = $variables['element'];
+
+  $attributes = array();
+  if (isset($element['#id'])) {
+    $attributes['id'] = $element['#id'];
+  }
+  if (!empty($element['#attributes']['class'])) {
+    $attributes['class'] = (array) $element['#attributes']['class'];
+  }
+  $attributes['class'][] = 'form-managed-file';
+
+  // This wrapper is required to apply JS behaviors and CSS styling.
+  $output = '';
+  $output .= '<div' . drupal_attributes($attributes) . '>';
+  $output .= drupal_render_children($element);
+  $output .= '</div>';
+  return $output;
+}
+
+/**
+ * Implements hook_theme().
+ */
+function multiple_file_form_element_theme() {
+  return array(
+    'managed_file_multiple' => array(
+      'render element' => 'element',
+    ),
+  );
+}
